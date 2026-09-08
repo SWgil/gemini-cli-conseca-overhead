@@ -13,6 +13,11 @@ import { debugLogger } from '../../utils/debugLogger.js';
 import { SafetyCheckDecision } from '../protocol.js';
 
 import { LlmRole } from '../../telemetry/index.js';
+import * as metrics from './metrics.js';
+import {
+  deterministicEnforcement,
+  ARG_CONSTRAINTS_INSTRUCTION,
+} from './deterministic-enforcer.js';
 
 const CONSECA_POLICY_GENERATION_PROMPT = `
 You are a security expert responsible for generating fine-grained security policies for a large language model integrated into a command-line tool. Your role is to act as a "policy generator" that creates temporary, context-specific rules based on a user's prompt and the tools available to the main LLM.
@@ -89,6 +94,22 @@ const SecurityPolicyResponseSchema = z.object({
   ),
 });
 
+/**
+ * Deterministic enforcement needs machine-checkable constraints, so it asks
+ * for one extra field. The stock schema is left untouched so the LLM-enforcer
+ * arm of the comparison sees exactly the shipped prompt and schema.
+ */
+const DeterministicSecurityPolicyResponseSchema = z.object({
+  policies: z.array(
+    z.object({
+      tool_name: z.string(),
+      policy: ToolPolicySchema.extend({
+        arg_constraints: z.record(z.string()),
+      }),
+    }),
+  ),
+});
+
 export interface PolicyGenerationResult {
   policy: SecurityPolicy;
   error?: string;
@@ -102,20 +123,29 @@ export async function generatePolicy(
   trustedContent: string,
   config: Config,
 ): Promise<PolicyGenerationResult> {
-  const model = DEFAULT_GEMINI_FLASH_MODEL;
+  const model = metrics.stageModel('generate', DEFAULT_GEMINI_FLASH_MODEL);
   const contentGenerator = config.getContentGenerator();
 
   if (!contentGenerator) {
     return { policy: {}, error: 'Content generator not initialized' };
   }
 
+  const deterministic = deterministicEnforcement();
+  const responseSchema = deterministic
+    ? DeterministicSecurityPolicyResponseSchema
+    : SecurityPolicyResponseSchema;
+  const promptTemplate = deterministic
+    ? CONSECA_POLICY_GENERATION_PROMPT + ARG_CONSTRAINTS_INSTRUCTION
+    : CONSECA_POLICY_GENERATION_PROMPT;
+
+  const started = performance.now();
   try {
     const result = await contentGenerator.generateContent(
       {
         model,
         config: {
           responseMimeType: 'application/json',
-          responseSchema: zodToJsonSchema(SecurityPolicyResponseSchema, {
+          responseSchema: zodToJsonSchema(responseSchema, {
             target: 'openApi3',
           }),
         },
@@ -124,7 +154,7 @@ export async function generatePolicy(
             role: 'user',
             parts: [
               {
-                text: safeTemplateReplace(CONSECA_POLICY_GENERATION_PROMPT, {
+                text: safeTemplateReplace(promptTemplate, {
                   user_prompt: userPrompt,
                   trusted_content: trustedContent,
                 }),
@@ -137,6 +167,14 @@ export async function generatePolicy(
       LlmRole.SUBAGENT,
     );
 
+    metrics.record({
+      kind: 'policy_llm',
+      stage: 'generate',
+      model,
+      seconds: (performance.now() - started) / 1000,
+      ...metrics.usageOf(result),
+    });
+
     const responseText = getResponseText(result);
     debugLogger.debug(
       `[Conseca] Policy Generation Raw Response: ${responseText}`,
@@ -147,18 +185,30 @@ export async function generatePolicy(
     }
 
     try {
-      const parsed = SecurityPolicyResponseSchema.parse(
-        JSON.parse(responseText),
-      );
+      const parsed = responseSchema.parse(JSON.parse(responseText));
       const policiesList = parsed.policies;
       const policy: SecurityPolicy = {};
       for (const item of policiesList) {
         policy[item.tool_name] = item.policy;
       }
 
+      metrics.record({
+        kind: 'policy_parse',
+        stage: 'generate',
+        model,
+        ok: true,
+      });
       debugLogger.debug(`[Conseca] Policy Generation Parsed:`, policy);
       return { policy };
     } catch (parseError) {
+      metrics.record({
+        kind: 'policy_parse',
+        stage: 'generate',
+        model,
+        ok: false,
+        error:
+          parseError instanceof Error ? parseError.message : String(parseError),
+      });
       debugLogger.debug(
         `[Conseca] Policy Generation JSON Parse Error:`,
         parseError,
@@ -169,6 +219,13 @@ export async function generatePolicy(
       };
     }
   } catch (error) {
+    metrics.record({
+      kind: 'policy_llm',
+      stage: 'generate',
+      model,
+      seconds: (performance.now() - started) / 1000,
+      error: error instanceof Error ? error.message : String(error),
+    });
     debugLogger.error('Policy generation failed:', error);
     return {
       policy: {},

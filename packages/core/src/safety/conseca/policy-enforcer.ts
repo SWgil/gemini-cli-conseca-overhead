@@ -15,6 +15,11 @@ import { DEFAULT_GEMINI_FLASH_MODEL } from '../../config/models.js';
 import { debugLogger } from '../../utils/debugLogger.js';
 
 import { LlmRole } from '../../telemetry/index.js';
+import * as metrics from './metrics.js';
+import {
+  deterministicEnforcement,
+  enforcePolicyDeterministic,
+} from './deterministic-enforcer.js';
 
 const CONSECA_ENFORCEMENT_PROMPT = `
 You are a security enforcement engine. Your goal is to check if a specific tool call complies with a given security policy.
@@ -55,7 +60,20 @@ export async function enforcePolicy(
   toolCall: FunctionCall,
   config: Config,
 ): Promise<SafetyCheckResult> {
-  const model = DEFAULT_GEMINI_FLASH_MODEL;
+  if (deterministicEnforcement()) {
+    const started = performance.now();
+    const result = enforcePolicyDeterministic(policy, toolCall);
+    metrics.record({
+      kind: 'policy_llm',
+      stage: 'enforce',
+      model: 'deterministic',
+      tool: toolCall.name ?? '',
+      seconds: (performance.now() - started) / 1000,
+    });
+    return result;
+  }
+
+  const model = metrics.stageModel('enforce', DEFAULT_GEMINI_FLASH_MODEL);
   const contentGenerator = config.getContentGenerator();
 
   if (!contentGenerator) {
@@ -85,6 +103,7 @@ export async function enforcePolicy(
     toolCallStr,
   );
 
+  const started = performance.now();
   try {
     const result = await contentGenerator.generateContent(
       {
@@ -113,6 +132,15 @@ export async function enforcePolicy(
       LlmRole.SUBAGENT,
     );
 
+    metrics.record({
+      kind: 'policy_llm',
+      stage: 'enforce',
+      model,
+      tool: toolName,
+      seconds: (performance.now() - started) / 1000,
+      ...metrics.usageOf(result),
+    });
+
     const responseText = getResponseText(result);
     debugLogger.debug(`[Conseca] Enforcement Raw Response: ${responseText}`);
 
@@ -126,6 +154,13 @@ export async function enforcePolicy(
 
     try {
       const parsed = EnforcementResultSchema.parse(JSON.parse(responseText));
+      metrics.record({
+        kind: 'policy_parse',
+        stage: 'enforce',
+        model,
+        tool: toolName,
+        ok: true,
+      });
       debugLogger.debug(`[Conseca] Enforcement Parsed:`, parsed);
 
       let decision: SafetyCheckDecision;
@@ -147,6 +182,16 @@ export async function enforcePolicy(
         reason: parsed.reason,
       };
     } catch (parseError) {
+      // NOTE: a parse failure here is fail-open - the tool call is allowed.
+      metrics.record({
+        kind: 'policy_parse',
+        stage: 'enforce',
+        model,
+        tool: toolName,
+        ok: false,
+        error:
+          parseError instanceof Error ? parseError.message : String(parseError),
+      });
       return {
         decision: SafetyCheckDecision.ALLOW,
         reason: 'JSON Parse Error in enforcement response',
@@ -154,6 +199,14 @@ export async function enforcePolicy(
       };
     }
   } catch (error) {
+    metrics.record({
+      kind: 'policy_llm',
+      stage: 'enforce',
+      model,
+      tool: toolName,
+      seconds: (performance.now() - started) / 1000,
+      error: error instanceof Error ? error.message : String(error),
+    });
     debugLogger.error('Policy enforcement failed:', error);
     return {
       decision: SafetyCheckDecision.ALLOW,

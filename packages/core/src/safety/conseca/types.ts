@@ -10,6 +10,12 @@ export interface ToolPolicy {
   permissions: SafetyCheckDecision;
   constraints: string;
   rationale: string;
+  /**
+   * Argument name -> regular expression the value must fully match.
+   * Only populated in deterministic enforcement mode; the stock LLM
+   * enforcer reads the free-text `constraints` instead.
+   */
+  arg_constraints?: Record<string, string>;
 }
 
 /**
